@@ -85,6 +85,15 @@ async function run(): Promise<void> {
     const writtenFiles = await generator.writeTests(tests);
     core.endGroup();
 
+    // Write POM files (when pomOutputDirectory is configured)
+    let pomFiles: string[] = [];
+    if (config.pomOutputDirectory && generator.getGeneratedPomFiles().length > 0) {
+      core.startGroup('📄 Writing page object files');
+      pomFiles = await generator.writePomFiles();
+      core.info(`Wrote ${pomFiles.length} page object file(s)`);
+      core.endGroup();
+    }
+
     // Write fixture files (API mock extraction)
     let fixtureFiles: string[] = [];
     if (config.generateApiMocks) {
@@ -207,6 +216,12 @@ function parseConfig(): ActionConfig {
     dryRun: core.getBooleanInput('dry_run'),
     customInstructions: core.getInput('custom_instructions') || '',
 
+    // Feature: Project Structure Discovery
+    pomPatterns: parseCSV(core.getInput('pom_patterns')),
+    utilityPatterns: parseCSV(core.getInput('utility_patterns')),
+    pomOutputDirectory: core.getInput('pom_output_directory') || '',
+    projectContextBudget: parseInt(core.getInput('project_context_budget') || '8000', 10),
+
     // Feature: Trace Viewer Integration
     traceOnFailure: core.getBooleanInput('trace_on_failure'),
     traceMode: rawTraceMode as TraceMode,
@@ -241,7 +256,11 @@ function getBaseBranch(): string {
   if (context.payload.pull_request) {
     return context.payload.pull_request.base.ref;
   }
-  return context.ref.replace('refs/heads/', '');
+  // For push events, target the PR's source branch (the branch being pushed to).
+  // The AutoSpec PR should merge INTO this branch, not into main.
+  const branch = context.ref.replace('refs/heads/', '');
+  core.info(`Base branch for AutoSpec PR: ${branch} (from ${context.eventName} event)`);
+  return branch;
 }
 
 // ─── Outputs ───

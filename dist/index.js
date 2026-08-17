@@ -35997,8 +35997,31 @@ class DiffAnalyzer {
         result.files = this.filterFiles(result.files);
         // Filter out non-source files (images, lockfiles, etc.)
         result.files = result.files.filter(f => this.isSourceFile(f.filename));
+        // Read full file contents at HEAD for non-deleted files
+        await this.loadFullContents(result);
         core.info(`Found ${result.files.length} relevant changed files after filtering`);
         return result;
+    }
+    // ─── Full File Content Loading ───
+    static MAX_FILE_CONTENT_BYTES = 30_000; // ~30KB per file to stay within token budgets
+    async loadFullContents(result) {
+        for (const file of result.files) {
+            if (file.status === 'deleted')
+                continue;
+            try {
+                const content = await this.execGit('show', `${result.headSha}:${file.filename}`);
+                if (content.length <= DiffAnalyzer.MAX_FILE_CONTENT_BYTES) {
+                    file.fullContent = content;
+                }
+                else {
+                    file.fullContent = content.slice(0, DiffAnalyzer.MAX_FILE_CONTENT_BYTES) + '\n// ... (truncated)';
+                }
+            }
+            catch {
+                // Binary file or other read failure — skip
+                core.debug(`Could not read full content for ${file.filename}`);
+            }
+        }
     }
     resolveMode() {
         if (this.config.diffMode !== 'auto')
@@ -36165,13 +36188,340 @@ exports.DiffAnalyzer = DiffAnalyzer;
 
 /***/ }),
 
-/***/ 7670:
-/***/ ((__unused_webpack_module, exports) => {
+/***/ 3836:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
 "use strict";
 
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.ProjectScanner = void 0;
+const core = __importStar(__nccwpck_require__(7484));
+const fs = __importStar(__nccwpck_require__(9896));
+const path = __importStar(__nccwpck_require__(6928));
+const glob_1 = __nccwpck_require__(1363);
+// Default patterns when user provides none
+const DEFAULT_POM_PATTERNS = [
+    '**/*.page.ts',
+    '**/pages/**/*.ts',
+    '**/page-objects/**/*.ts',
+    '**/page-object/**/*.ts',
+    '**/*.pom.ts',
+    '**/*.po.ts',
+    '**/pom/**/*.ts',
+];
+const DEFAULT_UTILITY_PATTERNS = [
+    '**/helpers/**/*.ts',
+    '**/utils/**/*.ts',
+    '**/fixtures/**/*.ts',
+    '**/support/**/*.ts',
+    '**/*.helper.ts',
+    '**/*.util.ts',
+];
+const GLOBAL_IGNORE = ['**/node_modules/**', '**/dist/**', '**/.git/**', '**/*.d.ts', '**/*.min.*'];
+const MAX_FILE_SIZE = 50_000; // 50KB per file
+class ProjectScanner {
+    config;
+    constructor(config) {
+        this.config = config;
+    }
+    async scan(diff) {
+        core.info('Scanning project structure for page objects, utilities, and test coverage...');
+        const [pageObjects, utilities, coverage] = await Promise.all([
+            this.discoverPageObjects(),
+            this.discoverUtilities(),
+            this.analyzeTestCoverage(),
+        ]);
+        core.info(`Discovered: ${pageObjects.length} page objects, ${utilities.length} utility files, ${coverage.length} tested files`);
+        // Score by relevance to the current diff and trim to budget
+        return this.applyRelevanceAndBudget(pageObjects, utilities, coverage, diff);
+    }
+    // ─── Page Object Discovery ───
+    async discoverPageObjects() {
+        const patterns = this.config.pomPatterns.length > 0
+            ? this.config.pomPatterns
+            : DEFAULT_POM_PATTERNS;
+        const files = await this.globFiles(patterns);
+        const results = [];
+        for (const filepath of files) {
+            const content = this.readFileSafe(filepath);
+            if (!content)
+                continue;
+            // Must export a class to be considered a page object
+            const classMatch = content.match(/export\s+(?:default\s+)?class\s+(\w+)/);
+            if (!classMatch)
+                continue;
+            const rel = path.relative(process.cwd(), filepath);
+            results.push({ filepath: rel, className: classMatch[1], source: content });
+        }
+        return results;
+    }
+    // ─── Utility Discovery ───
+    async discoverUtilities() {
+        const patterns = this.config.utilityPatterns.length > 0
+            ? this.config.utilityPatterns
+            : DEFAULT_UTILITY_PATTERNS;
+        const files = await this.globFiles(patterns);
+        const results = [];
+        for (const filepath of files) {
+            const content = this.readFileSafe(filepath);
+            if (!content)
+                continue;
+            // Must have at least one export
+            if (!/export\s/.test(content))
+                continue;
+            const rel = path.relative(process.cwd(), filepath);
+            results.push({ filepath: rel, source: content });
+        }
+        return results;
+    }
+    // ─── Test Coverage Analysis ───
+    async analyzeTestCoverage() {
+        const results = [];
+        const seen = new Set();
+        for (const pattern of this.config.testPatterns) {
+            const matches = await (0, glob_1.glob)(pattern, { absolute: true, ignore: GLOBAL_IGNORE });
+            for (const filepath of matches) {
+                if (results.length >= 50)
+                    break;
+                const rel = path.relative(process.cwd(), filepath);
+                if (seen.has(rel))
+                    continue;
+                seen.add(rel);
+                const content = this.readFileSafe(filepath);
+                if (!content)
+                    continue;
+                const info = this.extractCoverage(rel, content);
+                if (info)
+                    results.push(info);
+            }
+            if (results.length >= 50)
+                break;
+        }
+        return results;
+    }
+    extractCoverage(filepath, content) {
+        const routes = [];
+        const importedPageObjects = [];
+        const describedFlows = [];
+        const testNames = [];
+        let match;
+        // Routes: page.goto('...') or page.navigate('...')
+        const routeRegex = /(?:page\.goto|page\.navigate)\s*\(\s*['"`]([^'"`]+)/g;
+        while ((match = routeRegex.exec(content)) !== null) {
+            routes.push(match[1]);
+        }
+        // Imported page objects
+        const importRegex = /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
+        while ((match = importRegex.exec(content)) !== null) {
+            const importPath = match[2];
+            if (/page|pom|object/i.test(importPath)) {
+                const names = match[1].split(',').map(s => s.trim()).filter(Boolean);
+                importedPageObjects.push(...names);
+            }
+        }
+        // test.describe names
+        const describeRegex = /test\.describe\s*\(\s*['"`]([^'"`]+)/g;
+        while ((match = describeRegex.exec(content)) !== null) {
+            describedFlows.push(match[1]);
+        }
+        // test() names — captures what's actually being tested
+        const testRegex = /\btest\s*\(\s*['"`]([^'"`]+)/g;
+        while ((match = testRegex.exec(content)) !== null) {
+            testNames.push(match[1]);
+        }
+        if (routes.length === 0 && testNames.length === 0)
+            return null;
+        return { filepath, routes, importedPageObjects, describedFlows, testNames };
+    }
+    // ─── Relevance Scoring & Token Budget ───
+    applyRelevanceAndBudget(pageObjects, utilities, coverage, diff) {
+        const budget = this.config.projectContextBudget;
+        const pomBudget = Math.floor(budget * 0.5);
+        const utilBudget = Math.floor(budget * 0.2);
+        const coverageBudget = Math.floor(budget * 0.3);
+        // Score and sort page objects by relevance to the diff
+        const scoredPom = pageObjects
+            .map(po => ({ item: po, score: this.scoreRelevance(po.filepath, po.className, diff) }))
+            .sort((a, b) => b.score - a.score);
+        const scoredUtil = utilities
+            .map(u => ({ item: u, score: this.scoreRelevance(u.filepath, null, diff) }))
+            .sort((a, b) => b.score - a.score);
+        // Trim source to fit budget (truncate individual files if needed)
+        const trimmedPom = this.trimSourcesToBudget(scoredPom.map(s => s.item), pomBudget);
+        const trimmedUtil = this.trimSourcesToBudget(scoredUtil.map(s => s.item), utilBudget);
+        const trimmedCoverage = this.trimToTokenBudget(coverage, coverageBudget, (c) => this.estimateCoverageTokens(c));
+        return { pageObjects: trimmedPom, utilities: trimmedUtil, coverage: trimmedCoverage };
+    }
+    scoreRelevance(filepath, className, diff) {
+        let score = 1;
+        const fileDir = path.dirname(filepath);
+        for (const changed of diff.files) {
+            if (changed.fullContent && this.contentReferencesFile(changed.fullContent, filepath)) {
+                score += 10;
+            }
+            if (path.dirname(changed.filename) === fileDir) {
+                score += 5;
+            }
+            if (className && changed.fullContent && changed.fullContent.includes(className)) {
+                score += 3;
+            }
+        }
+        return score;
+    }
+    contentReferencesFile(content, filepath) {
+        const withoutExt = filepath.replace(/\.\w+$/, '');
+        const basename = path.basename(withoutExt);
+        return content.includes(basename);
+    }
+    /**
+     * Trim source-carrying items to a token budget.
+     * High-relevance items get more space; low-relevance items may be truncated or dropped.
+     */
+    trimSourcesToBudget(items, budgetTokens) {
+        const result = [];
+        let usedTokens = 0;
+        // Per-file cap: no single file takes more than 40% of the category budget
+        const perFileCap = Math.floor(budgetTokens * 0.4);
+        for (const item of items) {
+            let tokens = Math.ceil(item.source.length / 4);
+            if (tokens > perFileCap) {
+                // Truncate the source to fit the per-file cap
+                const maxChars = perFileCap * 4;
+                item.source = item.source.slice(0, maxChars) + '\n// ... (truncated)';
+                tokens = perFileCap;
+            }
+            if (usedTokens + tokens > budgetTokens)
+                break;
+            result.push(item);
+            usedTokens += tokens;
+        }
+        return result;
+    }
+    trimToTokenBudget(items, budgetTokens, estimator) {
+        const result = [];
+        let usedTokens = 0;
+        for (const item of items) {
+            const cost = estimator(item);
+            if (usedTokens + cost > budgetTokens)
+                break;
+            result.push(item);
+            usedTokens += cost;
+        }
+        return result;
+    }
+    estimateCoverageTokens(c) {
+        let chars = c.filepath.length;
+        chars += c.routes.join(', ').length;
+        chars += c.describedFlows.join(', ').length;
+        chars += c.testNames.join(', ').length;
+        return Math.ceil(chars / 4);
+    }
+    // ─── File Helpers ───
+    async globFiles(patterns) {
+        const seen = new Set();
+        const results = [];
+        for (const pattern of patterns) {
+            const matches = await (0, glob_1.glob)(pattern, { absolute: true, ignore: GLOBAL_IGNORE });
+            for (const filepath of matches) {
+                if (!seen.has(filepath)) {
+                    seen.add(filepath);
+                    results.push(filepath);
+                }
+            }
+        }
+        return results;
+    }
+    readFileSafe(filepath) {
+        try {
+            const stat = fs.statSync(filepath);
+            if (stat.size > MAX_FILE_SIZE)
+                return null;
+            return fs.readFileSync(filepath, 'utf-8');
+        }
+        catch {
+            return null;
+        }
+    }
+}
+exports.ProjectScanner = ProjectScanner;
+
+
+/***/ }),
+
+/***/ 7670:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.PromptBuilder = void 0;
+const path = __importStar(__nccwpck_require__(6928));
 /**
  * Builds structured prompts for two-phase test generation:
  *   Phase 1: Analyze diff → produce a test plan (JSON)
@@ -36179,8 +36529,17 @@ exports.PromptBuilder = void 0;
  */
 class PromptBuilder {
     config;
+    projectContext;
     constructor(config) {
         this.config = config;
+    }
+    setProjectContext(ctx) {
+        this.projectContext = ctx;
+    }
+    /** Returns true when the scanner discovered page objects or utilities. */
+    hasProjectArtifacts() {
+        return !!this.projectContext && (this.projectContext.pageObjects.length > 0 ||
+            this.projectContext.utilities.length > 0);
     }
     // ─── Phase 1: Test Planning ───
     buildPlanPrompt(diff, existingTests) {
@@ -36189,6 +36548,10 @@ class PromptBuilder {
             .join('\n');
         const fileChangeSummary = diff.files
             .map(f => this.summarizeFile(f))
+            .join('\n\n');
+        const fullSourceContext = diff.files
+            .filter(f => f.fullContent)
+            .map(f => this.formatFullSource(f))
             .join('\n\n');
         return `You are an expert QA automation engineer. Analyze the following code changes and produce a test plan.
 
@@ -36207,13 +36570,19 @@ ${diff.summary}
 
 ${fileChangeSummary}
 
+${fullSourceContext ? `## Full Source Files (for context)\nThe complete source of each changed file, so you can understand imports, component structure, routing, and how the changes fit into the broader codebase.\n\n${fullSourceContext}` : ''}
+${this.buildProjectContextForPlan()}
 ## Instructions
 1. Analyze what user-facing behavior changed or was added.
 2. Identify the E2E test scenarios that would validate these changes.
 3. Skip changes that are purely internal/backend with no UI impact, unless they affect API responses rendered in the UI.
 4. Prioritize: new features > modified flows > edge cases.
 5. Don't duplicate coverage already in existing tests unless the behavior changed.
-6. Assign a severity to each test based on the user impact of what it validates:
+${this.hasProjectArtifacts() ? `6. MUST reuse existing page objects and their locators listed above rather than inventing new ones.
+7. MUST use existing utility functions where applicable.
+8. Do NOT generate tests for user flows already covered in existing test coverage unless the behavior changed in this diff.
+9.` : `6. Do NOT generate tests for user flows already covered in existing test coverage unless the behavior changed in this diff.
+7.`} Assign a severity to each test based on the user impact of what it validates:
    - sev1 (Critical): Core user flows — authentication, checkout, data loss prevention, payment processing
    - sev2 (High): Important features, commonly used paths, key business logic
    - sev3 (Medium): Secondary features, less frequent user flows, settings pages
@@ -36270,6 +36639,14 @@ If no tests are needed (e.g., only config/docs changed), return:
             .filter(f => f.filename !== plan.targetFile)
             .filter(f => this.isRelated(f.filename, plan.targetFile))
             .slice(0, 3);
+        // Full source context for the target file and related files
+        const targetFullSource = targetDiff?.fullContent
+            ? `## Full Source: ${targetDiff.filename}\nThe complete file so you can see imports, component structure, routes, state, and how the diff fits in.\n\`\`\`typescript\n${targetDiff.fullContent}\n\`\`\``
+            : '';
+        const relatedFullSources = relatedDiffs
+            .filter(d => d.fullContent)
+            .map(d => this.formatFullSource(d))
+            .join('\n\n');
         return `You are an expert Playwright test author. Generate a production-quality E2E test file.
 
 ## Test Specification
@@ -36282,19 +36659,23 @@ If no tests are needed (e.g., only config/docs changed), return:
 ## User Flows to Test
 ${plan.userFlows.map((f, i) => `${i + 1}. ${f}`).join('\n')}
 
-## Source Code Changes
+${targetFullSource}
+
+## Source Code Changes (diff)
 ${targetDiff ? this.formatDiff(targetDiff) : '(target file diff not available)'}
 
 ${relatedDiffs.length > 0 ? '## Related Changes\n' + relatedDiffs.map(d => this.formatDiff(d)).join('\n\n') : ''}
 
-${styleReference ? `## Style Reference (match this pattern)\n\`\`\`typescript\n${styleReference}\n\`\`\`` : ''}
+${relatedFullSources ? `## Related Full Sources\n${relatedFullSources}` : ''}
 
+${styleReference ? `## Style Reference (match this pattern)\n\`\`\`typescript\n${styleReference}\n\`\`\`` : ''}
+${this.buildProjectContextForTest(plan.testFilename)}
 ## Requirements
 1. Use Playwright test runner with TypeScript.
 2. Import from '@playwright/test' (test, expect, Page).
 3. Use test.describe() blocks to group related tests.
 4. Use descriptive test names that explain the expected behavior.
-5. Use page object patterns where it reduces duplication.
+${this.hasProjectArtifacts() ? `5. Use the page objects and utilities listed above. Do NOT create inline locators for elements that already have locators in page objects. Do NOT invent page objects or utility functions that are not listed.` : `5. Use accessible selectors (role, label, text) or data-testid attributes for locators.`}
 6. Add meaningful assertions — not just "page loads".
 7. Use data-testid selectors when inferrable, otherwise use accessible selectors (role, label, text).
 8. Handle async operations with proper waitFor / expect patterns.
@@ -36368,7 +36749,108 @@ Generate a SEPARATE test case that runs an axe-core accessibility scan:
         }
         return section;
     }
+    // ─── Project Context Sections ───
+    buildProjectContextForPlan() {
+        if (!this.projectContext)
+            return '';
+        const sections = [];
+        // Page objects — show actual source code so the LLM sees exactly what exists
+        if (this.projectContext.pageObjects.length > 0) {
+            const items = this.projectContext.pageObjects.map(po => `### ${po.className} (${po.filepath})\n\`\`\`typescript\n${po.source}\n\`\`\``).join('\n\n');
+            sections.push(`## Available Page Objects — REAL SOURCE CODE
+The project already has these page object classes. Read the source carefully — use ONLY the classes, methods, elements, and locators that actually exist in this code.
+${items}`);
+        }
+        // Utilities — show actual source
+        if (this.projectContext.utilities.length > 0) {
+            const items = this.projectContext.utilities.map(u => `### ${u.filepath}\n\`\`\`typescript\n${u.source}\n\`\`\``).join('\n\n');
+            sections.push(`## Available Utilities — REAL SOURCE CODE
+These utility files exist in the project. Use the functions and constants you see in the source.
+${items}`);
+        }
+        // Coverage — show individual test names so LLM can see what's already tested
+        if (this.projectContext.coverage.length > 0) {
+            const items = this.projectContext.coverage.map(c => {
+                const parts = [`- ${c.filepath}`];
+                if (c.describedFlows.length > 0) {
+                    parts.push(`  Flows: ${c.describedFlows.join(', ')}`);
+                }
+                if (c.testNames.length > 0) {
+                    parts.push(`  Tests: ${c.testNames.join(' | ')}`);
+                }
+                if (c.routes.length > 0) {
+                    parts.push(`  Routes: ${c.routes.join(', ')}`);
+                }
+                return parts.join('\n');
+            }).join('\n');
+            sections.push(`## Existing Test Coverage
+These tests already exist. Do NOT duplicate them — only generate tests for NEW or CHANGED behavior.
+${items}`);
+        }
+        return sections.length > 0 ? '\n' + sections.join('\n\n') + '\n' : '';
+    }
+    buildProjectContextForTest(testFilename) {
+        if (!this.projectContext)
+            return '';
+        const sections = [];
+        const testOutputPath = path.join(this.config.testDirectory, testFilename);
+        const testDir = path.dirname(testOutputPath);
+        // Page objects — exact import statement + full source
+        if (this.projectContext.pageObjects.length > 0) {
+            const items = this.projectContext.pageObjects.map(po => {
+                const relativePath = this.computeImportPath(testDir, po.filepath);
+                return `### ${po.className}
+\`import { ${po.className} } from '${relativePath}';\`
+\`\`\`typescript
+${po.source}
+\`\`\``;
+            }).join('\n\n');
+            sections.push(`## Page Objects — REAL SOURCE CODE
+Use EXACTLY the import statements shown. Only use methods, elements, and locators that exist in the source below.
+${items}`);
+        }
+        // Utilities — exact import path + full source
+        if (this.projectContext.utilities.length > 0) {
+            const items = this.projectContext.utilities.map(u => {
+                const relativePath = this.computeImportPath(testDir, u.filepath);
+                return `### ${u.filepath}
+Import from: \`'${relativePath}'\`
+\`\`\`typescript
+${u.source}
+\`\`\``;
+            }).join('\n\n');
+            sections.push(`## Utility Functions — REAL SOURCE CODE
+${items}`);
+        }
+        if (sections.length > 0) {
+            const pomRule = this.config.pomOutputDirectory
+                ? `- If you need a NEW page object class that doesn't exist above, create it as a SEPARATE file. The file must be placed under "${this.config.pomOutputDirectory}/" and returned as an additional code block with a "// POM_FILE: <filename>" header on the first line.`
+                : `- Do NOT create page object classes inline in test files — use the existing ones above.`;
+            sections.push(`## CRITICAL RULES
+- Copy import statements EXACTLY as shown — class names and paths must match character-for-character.
+- ONLY use methods, elements, locators, and properties that exist in the source code above.
+- Do NOT invent, guess, or hallucinate any methods, elements, or locators.
+- Do NOT rename or abbreviate class names.
+${pomRule}
+- If the existing page objects don't have what you need, use raw \`page.locator()\` or \`page.getByTestId()\` calls instead of inventing POM methods.`);
+        }
+        return sections.length > 0 ? '\n' + sections.join('\n\n') + '\n' : '';
+    }
+    computeImportPath(fromDir, toFilepath) {
+        const withoutExt = toFilepath.replace(/\.\w+$/, '');
+        let rel = path.relative(fromDir, withoutExt);
+        if (!rel.startsWith('.')) {
+            rel = './' + rel;
+        }
+        return rel;
+    }
     // ─── Helpers ───
+    formatFullSource(file) {
+        return `### ${file.filename} (full source)
+\`\`\`typescript
+${file.fullContent}
+\`\`\``;
+    }
     summarizeFile(file) {
         const maxPatchLines = 80;
         const patchLines = file.patch.split('\n');
@@ -36463,6 +36945,7 @@ const glob_1 = __nccwpck_require__(1363);
 const prompts_1 = __nccwpck_require__(7670);
 const test_post_processor_1 = __nccwpck_require__(9213);
 const fixture_extractor_1 = __nccwpck_require__(1797);
+const project_scanner_1 = __nccwpck_require__(3836);
 // [FIX #3] Safe filename pattern: allow alphanumeric, hyphens, underscores, dots, forward slashes
 // but no '..' segments, no absolute paths, no backslashes
 const SAFE_FILENAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._\-/]*$/;
@@ -36489,6 +36972,7 @@ class TestGenerator {
     llm;
     prompts;
     extractedFixtures = [];
+    generatedPomFiles = [];
     constructor(config, llm) {
         this.config = config;
         this.llm = llm;
@@ -36502,6 +36986,10 @@ class TestGenerator {
         // Step 1: Discover existing tests for style reference + dedup
         const existingTests = await this.discoverExistingTests();
         core.info(`Found ${existingTests.length} existing test files for reference`);
+        // Step 1b: Scan project structure for POM, utilities, and coverage
+        const scanner = new project_scanner_1.ProjectScanner(this.config);
+        const projectContext = await scanner.scan(diff);
+        this.prompts.setProjectContext(projectContext);
         // Step 2: Generate test plan
         const plan = await this.generatePlan(diff, existingTests);
         if (plan.tests.length === 0) {
@@ -36562,6 +37050,50 @@ class TestGenerator {
     getExtractedFixtures() {
         return this.extractedFixtures;
     }
+    getGeneratedPomFiles() {
+        return this.generatedPomFiles;
+    }
+    async writePomFiles() {
+        if (this.generatedPomFiles.length === 0)
+            return [];
+        const written = [];
+        for (const pom of this.generatedPomFiles) {
+            const fullPath = path.resolve(pom.filepath);
+            const dir = path.dirname(fullPath);
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(fullPath, pom.content, 'utf-8');
+            written.push(pom.filepath);
+            core.info(`Wrote POM: ${pom.filepath}`);
+        }
+        return written;
+    }
+    /**
+     * Extract `// POM_FILE: <filename>` blocks from LLM output.
+     * Returns the test code with POM blocks removed.
+     */
+    extractPomFiles(code) {
+        const pomDir = this.config.pomOutputDirectory;
+        if (!pomDir)
+            return code;
+        const pomMarker = /^\/\/\s*POM_FILE:\s*(.+)$/gm;
+        const parts = code.split(pomMarker);
+        // If no POM_FILE markers found, return code as-is
+        if (parts.length <= 1)
+            return code;
+        // parts[0] is the test code before any POM_FILE marker
+        // parts[1] is the filename, parts[2] is the POM content, etc.
+        const testCode = parts[0];
+        for (let i = 1; i < parts.length; i += 2) {
+            const filename = parts[i].trim();
+            const pomContent = (parts[i + 1] || '').trim();
+            if (filename && pomContent) {
+                const filepath = path.join(pomDir, filename);
+                this.generatedPomFiles.push({ filename, filepath, content: pomContent });
+                core.info(`Extracted POM file: ${filepath}`);
+            }
+        }
+        return testCode.trim();
+    }
     // ─── Phase 1: Planning ───
     async generatePlan(diff, existingTests) {
         const prompt = this.prompts.buildPlanPrompt(diff, existingTests);
@@ -36571,7 +37103,7 @@ class TestGenerator {
                 content: 'You are a QA automation architect. Respond only with valid JSON. No markdown, no explanation.',
             },
             { role: 'user', content: prompt },
-        ], { maxTokens: 4096, temperature: 0.1 });
+        ], { maxTokens: 4096, temperature: 0 });
         // Parse the JSON response
         const cleaned = response.content
             .replace(/```json\s*/g, '')
@@ -36596,12 +37128,16 @@ class TestGenerator {
                 content: 'You are an expert Playwright test author. Respond with ONLY valid TypeScript code. No markdown fences, no commentary.',
             },
             { role: 'user', content: prompt },
-        ], { maxTokens: 8192, temperature: 0.2 });
+        ], { maxTokens: 8192, temperature: 0 });
         // Clean potential markdown fences from response
         let code = response.content
             .replace(/^```(?:typescript|ts)?\s*\n?/gm, '')
             .replace(/\n?```\s*$/gm, '')
             .trim();
+        // ─── Extract POM files if pomOutputDirectory is configured ───
+        if (this.config.pomOutputDirectory) {
+            code = this.extractPomFiles(code);
+        }
         // Ensure the file starts with an import
         if (!code.startsWith('import')) {
             const importIndex = code.indexOf('import');
@@ -36799,6 +37335,14 @@ async function run() {
         core.startGroup('💾 Writing test files');
         const writtenFiles = await generator.writeTests(tests);
         core.endGroup();
+        // Write POM files (when pomOutputDirectory is configured)
+        let pomFiles = [];
+        if (config.pomOutputDirectory && generator.getGeneratedPomFiles().length > 0) {
+            core.startGroup('📄 Writing page object files');
+            pomFiles = await generator.writePomFiles();
+            core.info(`Wrote ${pomFiles.length} page object file(s)`);
+            core.endGroup();
+        }
         // Write fixture files (API mock extraction)
         let fixtureFiles = [];
         if (config.generateApiMocks) {
@@ -36907,6 +37451,11 @@ function parseConfig() {
         maxTestFiles: rawMax,
         dryRun: core.getBooleanInput('dry_run'),
         customInstructions: core.getInput('custom_instructions') || '',
+        // Feature: Project Structure Discovery
+        pomPatterns: parseCSV(core.getInput('pom_patterns')),
+        utilityPatterns: parseCSV(core.getInput('utility_patterns')),
+        pomOutputDirectory: core.getInput('pom_output_directory') || '',
+        projectContextBudget: parseInt(core.getInput('project_context_budget') || '8000', 10),
         // Feature: Trace Viewer Integration
         traceOnFailure: core.getBooleanInput('trace_on_failure'),
         traceMode: rawTraceMode,
@@ -36936,7 +37485,11 @@ function getBaseBranch() {
     if (context.payload.pull_request) {
         return context.payload.pull_request.base.ref;
     }
-    return context.ref.replace('refs/heads/', '');
+    // For push events, target the PR's source branch (the branch being pushed to).
+    // The AutoSpec PR should merge INTO this branch, not into main.
+    const branch = context.ref.replace('refs/heads/', '');
+    core.info(`Base branch for AutoSpec PR: ${branch} (from ${context.eventName} event)`);
+    return branch;
 }
 // ─── Outputs ───
 function setOutputs(result) {
@@ -37037,7 +37590,7 @@ class AnthropicProvider {
         const response = await this.client.messages.create({
             model: this.model,
             max_tokens: options?.maxTokens ?? 8192,
-            temperature: options?.temperature ?? 0.2,
+            temperature: options?.temperature ?? 0,
             ...(systemMsg ? { system: systemMsg.content } : {}),
             messages: chatMessages,
         });
@@ -37121,7 +37674,7 @@ class OpenAIProvider {
             model: this.model,
             ...(isReasoning
                 ? { max_completion_tokens: options?.maxTokens ?? 8192 }
-                : { max_tokens: options?.maxTokens ?? 8192, temperature: options?.temperature ?? 0.2 }),
+                : { max_tokens: options?.maxTokens ?? 8192, temperature: options?.temperature ?? 0 }),
             messages: messages.map(m => ({
                 role: m.role,
                 content: m.content,
@@ -37390,6 +37943,12 @@ class GitOps {
         const context = github.context;
         const shortSha = sanitizeForCommitMessage(headSha.slice(0, 8));
         const branchName = `autospec/tests-${shortSha}`;
+        // ─── Dedup: skip if an AutoSpec PR already exists for this commit ───
+        const existingPr = await this.findExistingAutoSpecPR(shortSha);
+        if (existingPr) {
+            core.info(`AutoSpec PR #${existingPr} already exists for commit ${shortSha} — skipping duplicate PR creation`);
+            return existingPr;
+        }
         // Create and push branch
         await this.execGit('config', 'user.name', 'autospec-ai[bot]');
         await this.execGit('config', 'user.email', 'autospec-ai[bot]@users.noreply.github.com');
@@ -37488,6 +38047,28 @@ ${config?.accessibilityAssertions ? '- Aria snapshot assertions validate the acc
 <sub>Generated by AutoSpec AI • [Report Issue](https://github.com/autospec-ai/action/issues)</sub>`;
         return body;
     }
+    /**
+     * Check if an AutoSpec PR already exists for this commit SHA.
+     * Prevents duplicate PRs when the workflow triggers multiple times for the same push.
+     */
+    async findExistingAutoSpecPR(shortSha) {
+        const context = github.context;
+        try {
+            const { data: prs } = await this.octokit.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                head: `${context.repo.owner}:autospec/tests-${shortSha}`,
+            });
+            if (prs.length > 0) {
+                return prs[0].number;
+            }
+        }
+        catch {
+            // If the API call fails, proceed with PR creation
+        }
+        return null;
+    }
     // Note: Uses @actions/exec which passes args as an array (safe from shell injection)
     async execGit(...args) {
         let output = '';
@@ -37535,18 +38116,36 @@ class TestPostProcessor {
             `});`,
             '',
         ].join('\n');
-        // Find the end of the import block (last line starting with "import")
+        // Find the end of the import block (last contiguous import at the top of the file).
+        // Stop scanning once we hit actual code (test, class, const, let, etc.) to avoid
+        // inserting inside class bodies when the LLM emits stray imports mid-file.
         const lines = code.split('\n');
         let lastImportIndex = -1;
+        let inMultiLineImport = false;
         for (let i = 0; i < lines.length; i++) {
             const trimmed = lines[i].trimStart();
+            // Track multi-line imports: import { \n  Foo,\n  Bar\n } from '...';
+            if (inMultiLineImport) {
+                if (trimmed.startsWith('}') || trimmed.includes("} from ")) {
+                    lastImportIndex = i;
+                    inMultiLineImport = false;
+                }
+                continue;
+            }
             if (trimmed.startsWith('import ') || trimmed.startsWith('import{')) {
                 lastImportIndex = i;
+                // Check if this is a multi-line import (has { but no closing } on same line)
+                if (trimmed.includes('{') && !trimmed.includes('}')) {
+                    inMultiLineImport = true;
+                }
+                continue;
             }
-            // Also handle multi-line imports: find closing }
-            if (lastImportIndex >= 0 && trimmed.startsWith('}') && lines[lastImportIndex]?.includes('{')) {
-                lastImportIndex = i;
+            // Skip blank lines and comments between imports
+            if (trimmed === '' || trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*')) {
+                continue;
             }
+            // Any other code means the import block is over — stop scanning
+            break;
         }
         if (lastImportIndex === -1) {
             // No imports found — prepend

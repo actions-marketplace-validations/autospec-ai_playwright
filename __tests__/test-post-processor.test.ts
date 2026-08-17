@@ -43,6 +43,33 @@ test('example', async ({ page }) => {});`;
       expect(result).toContain("test.describe('Login'");
       expect(result).toContain("await page.goto('/login')");
     });
+
+    it('does not inject inside class bodies when stray imports appear mid-file', () => {
+      const codeWithInlineClass = `import { expect, test } from '../../fixtures/base';
+import { SettingsPage } from '../../pages/settings.page';
+
+let settingsPage: SettingsPage;
+
+test.describe('Settings', () => {
+  test('form is visible', async () => {});
+});
+import { Locator } from '@playwright/test';
+import { BasePage } from '../../pages/base.page';
+
+export class SettingsPage extends BasePage {
+  elements = {
+    getSaveButton: (): Locator => this.page.getByTestId('save-btn'),
+  };
+}`;
+
+      const result = TestPostProcessor.injectTraceConfig(codeWithInlineClass, 'retain-on-failure');
+      // The test.use block should appear AFTER the first two imports, not after the mid-file imports
+      const testUseIndex = result.indexOf('test.use({');
+      const classIndex = result.indexOf('export class');
+      expect(testUseIndex).toBeGreaterThan(-1);
+      expect(classIndex).toBeGreaterThan(-1);
+      expect(testUseIndex).toBeLessThan(classIndex);
+    });
   });
 
   describe('ensureAxeImport', () => {

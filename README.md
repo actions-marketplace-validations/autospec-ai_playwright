@@ -119,6 +119,31 @@ Update baselines after intentional UI changes:
 npx playwright test --update-snapshots
 ```
 
+### Project Structure Discovery
+AutoSpec scans your project for existing page objects, utility functions, and test coverage before generating tests. It injects the **actual source code** of discovered POM classes and utilities into the LLM prompt, so the model can see exactly what methods, elements, and locators exist — no regex extraction, no guessing.
+
+**What it discovers:**
+- **Page Objects** — Full source of classes matching POM patterns (methods, elements, locators, routes — everything)
+- **Utilities** — Full source of exported helper functions and constants
+- **Test Coverage** — Individual test names, flows, and routes already under test (so the LLM doesn't duplicate them)
+
+**Auto-detection** works out of the box for common conventions (`**/pages/**/*.ts`, `**/*.page.ts`, `**/*.po.ts`, `**/helpers/**/*.ts`, etc.). If your project uses different naming, configure the patterns explicitly:
+
+```yaml
+- uses: autospec-ai/action@v1
+  with:
+    llm_api_key: ${{ secrets.OPENAI_API_KEY }}
+    test_directory: 'e2e/tests'                        # where to write generated tests
+    pom_patterns: '**/*.po.ts,**/pageobjects/**/*.ts'  # match your POM convention
+    utility_patterns: '**/helpers/**/*.ts'              # match your utility convention
+    pom_output_directory: 'e2e/pages'                   # where to write NEW POM files
+    project_context_budget: '12000'                     # increase if you have many POMs
+```
+
+**`pom_output_directory`** — When set, the LLM can create new page object classes as separate files instead of inlining them in test specs. If not set, the LLM is instructed to only use existing POMs or raw `page.locator()` calls.
+
+**Tip:** Check the Action logs for `Discovered: X page objects, Y utility files, Z tested files` to verify the scanner is finding your project's artifacts. If the counts are 0, your file naming doesn't match the default patterns — set `pom_patterns` and `utility_patterns` explicitly.
+
 ### Aria Snapshot Assertions
 Adds `toMatchAriaSnapshot()` assertions to validate accessibility tree structure. Optionally generates a dedicated axe-core scan test case.
 
@@ -174,6 +199,19 @@ axe_standard: 'wcag2aa'  # wcag2a | wcag2aa | wcag21a | wcag21aa | best-practice
 | `visual_threshold` | `0.2` | Pixel comparison threshold (0-1) |
 | `visual_max_diff_ratio` | `0.05` | Maximum allowed diff pixel ratio (0-1) |
 | `visual_full_page` | `false` | Capture full-page screenshots instead of viewport only |
+
+### Project Structure Discovery
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `pom_patterns` | *(auto-detected)* | Comma-separated globs for page object files (e.g., `**/*.po.ts,**/pages/**/*.ts`) |
+| `utility_patterns` | *(auto-detected)* | Comma-separated globs for helper/utility files (e.g., `**/helpers/**/*.ts`) |
+| `pom_output_directory` | — | Directory for generated POM files. When set, the LLM creates new POMs as separate files instead of inlining them in test specs |
+| `project_context_budget` | `8000` | Approximate token budget for project context injected into LLM prompts |
+
+When left empty, the scanner uses built-in patterns:
+- **Page Objects:** `**/*.page.ts`, `**/pages/**/*.ts`, `**/page-objects/**/*.ts`, `**/*.pom.ts`, `**/*.po.ts`, `**/pom/**/*.ts`
+- **Utilities:** `**/helpers/**/*.ts`, `**/utils/**/*.ts`, `**/fixtures/**/*.ts`, `**/support/**/*.ts`, `**/*.helper.ts`, `**/*.util.ts`
 
 ### Accessibility
 
@@ -324,6 +362,8 @@ src/
 │   └── openai.ts               # OpenAI / compatible client
 ├── diff/
 │   └── analyzer.ts             # Git diff extraction & filtering
+├── discovery/
+│   └── project-scanner.ts      # Scans for existing POMs, utilities, and test coverage
 ├── generator/
 │   ├── prompts.ts              # Two-phase prompt construction with feature-conditional sections
 │   └── test-generator.ts       # Orchestrates planning + generation + post-processing

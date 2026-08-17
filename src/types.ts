@@ -38,6 +38,7 @@ export interface FileDiff {
   additions: number;
   deletions: number;
   previousFilename?: string;
+  fullContent?: string;    // full file content at HEAD (omitted for deleted files)
 }
 
 export interface DiffResult {
@@ -92,6 +93,33 @@ export interface TestPlanEntry {
   apiDependencies?: ApiDependency[];
 }
 
+// ─── Project Structure Discovery Types ───
+
+export interface PageObjectInfo {
+  filepath: string;           // relative path
+  className: string;          // e.g. "LoginPage"
+  source: string;             // truncated raw source code
+}
+
+export interface UtilityInfo {
+  filepath: string;
+  source: string;             // truncated raw source code
+}
+
+export interface TestCoverageInfo {
+  filepath: string;
+  routes: string[];              // URL paths tested (from goto/navigate)
+  importedPageObjects: string[]; // POM classes used
+  describedFlows: string[];      // test.describe names
+  testNames: string[];           // individual test() names
+}
+
+export interface ProjectContext {
+  pageObjects: PageObjectInfo[];
+  utilities: UtilityInfo[];
+  coverage: TestCoverageInfo[];
+}
+
 // ─── Action Configuration ───
 
 export type TraceMode = 'on' | 'off' | 'retain-on-failure' | 'on-first-retry';
@@ -110,6 +138,12 @@ export interface ActionConfig {
   maxTestFiles: number;
   dryRun: boolean;
   customInstructions: string;
+
+  // Feature: Project Structure Discovery
+  pomPatterns: string[];
+  utilityPatterns: string[];
+  pomOutputDirectory: string;
+  projectContextBudget: number;
 
   // Feature: Trace Viewer Integration
   traceOnFailure: boolean;
